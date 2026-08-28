@@ -9,6 +9,15 @@ export interface ChannelRow {
   uploads_playlist_id: string | null
   input_url: string | null
   active: number
+  folder_id: number | null
+  created_at: string
+}
+
+export interface FolderRow {
+  id: number
+  parent_id: number | null
+  name: string
+  sort_order: number
   created_at: string
 }
 
@@ -25,6 +34,8 @@ export interface RunRow {
   videos_found: number
   api_calls_used: number
   error: string | null
+  scope_folder_ids: string | null
+  scope_label: string | null
 }
 
 export interface RunVideoRow {
@@ -87,12 +98,13 @@ export async function insertChannel(
     thumbnail?: string | null
     uploads_playlist_id: string
     input_url: string
+    folder_id?: number | null
   }
 ): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO channels (channel_id, title, handle, thumbnail, uploads_playlist_id, input_url, active)
-       VALUES (?, ?, ?, ?, ?, ?, 1)`
+      `INSERT INTO channels (channel_id, title, handle, thumbnail, uploads_playlist_id, input_url, active, folder_id)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?)`
     )
     .bind(
       data.channel_id,
@@ -100,7 +112,8 @@ export async function insertChannel(
       data.handle || null,
       data.thumbnail || null,
       data.uploads_playlist_id,
-      data.input_url
+      data.input_url,
+      data.folder_id ?? null
     )
     .run()
 }
@@ -111,6 +124,83 @@ export async function deleteChannel(db: D1Database, id: number): Promise<void> {
 
 export async function setChannelActive(db: D1Database, id: number, active: boolean): Promise<void> {
   await db.prepare('UPDATE channels SET active = ? WHERE id = ?').bind(active ? 1 : 0, id).run()
+}
+
+export async function setChannelFolder(db: D1Database, id: number, folderId: number | null): Promise<void> {
+  await db.prepare('UPDATE channels SET folder_id = ? WHERE id = ?').bind(folderId, id).run()
+}
+
+export async function setChannelsFolderBulk(db: D1Database, ids: number[], folderId: number | null): Promise<void> {
+  if (ids.length === 0) return
+  const stmt = db.prepare('UPDATE channels SET folder_id = ? WHERE id = ?')
+  await db.batch(ids.map((id) => stmt.bind(folderId, id)))
+}
+
+// ---------- Folders (channel categories, unlimited depth) ----------
+
+export async function listFolders(db: D1Database): Promise<FolderRow[]> {
+  const res = await db
+    .prepare('SELECT * FROM channel_folders ORDER BY parent_id IS NOT NULL, parent_id ASC, sort_order ASC, id ASC')
+    .all<FolderRow>()
+  return res.results || []
+}
+
+export async function createFolder(db: D1Database, name: string, parentId: number | null): Promise<FolderRow> {
+  const res = await db
+    .prepare('INSERT INTO channel_folders (parent_id, name) VALUES (?, ?)')
+    .bind(parentId, name)
+    .run()
+  const id = res.meta.last_row_id as number
+  const row = await db.prepare('SELECT * FROM channel_folders WHERE id = ?').bind(id).first<FolderRow>()
+  return row as FolderRow
+}
+
+export async function renameFolder(db: D1Database, id: number, name: string): Promise<void> {
+  await db.prepare('UPDATE channel_folders SET name = ? WHERE id = ?').bind(name, id).run()
+}
+
+export async function moveFolder(db: D1Database, id: number, parentId: number | null): Promise<void> {
+  await db.prepare('UPDATE channel_folders SET parent_id = ? WHERE id = ?').bind(parentId, id).run()
+}
+
+// 해당 폴더 및 모든 하위 폴더 id 목록 (자기 자신 포함)
+export async function getFolderSubtreeIds(db: D1Database, folderId: number): Promise<number[]> {
+  const res = await db
+    .prepare(
+      `WITH RECURSIVE subtree(id) AS (
+         SELECT id FROM channel_folders WHERE id = ?
+         UNION ALL
+         SELECT f.id FROM channel_folders f JOIN subtree s ON f.parent_id = s.id
+       )
+       SELECT id FROM subtree`
+    )
+    .bind(folderId)
+    .all<{ id: number }>()
+  return (res.results || []).map((r) => r.id)
+}
+
+// 폴더 삭제: 하위 폴더들도 모두 삭제하고, 속해있던 채널들은 미분류(folder_id = NULL)로 이동
+export async function deleteFolder(db: D1Database, folderId: number): Promise<void> {
+  const ids = await getFolderSubtreeIds(db, folderId)
+  if (ids.length === 0) return
+  const placeholders = ids.map(() => '?').join(',')
+  await db.batch([
+    db.prepare(`UPDATE channels SET folder_id = NULL WHERE folder_id IN (${placeholders})`).bind(...ids),
+    db.prepare(`DELETE FROM channel_folders WHERE id IN (${placeholders})`).bind(...ids)
+  ])
+}
+
+// 특정 폴더들(및 그 하위 폴더 전부)에 속한 활성 채널 목록
+export async function listActiveChannelsInFolders(db: D1Database, folderIds: number[]): Promise<ChannelRow[]> {
+  if (folderIds.length === 0) return []
+  const placeholders = folderIds.map(() => '?').join(',')
+  const res = await db
+    .prepare(
+      `SELECT * FROM channels WHERE active = 1 AND folder_id IN (${placeholders}) ORDER BY created_at ASC, id ASC`
+    )
+    .bind(...folderIds)
+    .all<ChannelRow>()
+  return res.results || []
 }
 
 // ---------- Runs ----------
@@ -126,13 +216,20 @@ export async function createRun(
   db: D1Database,
   runDate: string,
   sinceAt: string,
-  channelIds: string[]
+  channelIds: string[],
+  scope?: { folderIds: number[] | null; label: string | null }
 ): Promise<RunRow> {
   const res = await db
     .prepare(
-      `INSERT INTO runs (run_date, since_at, status, total_channels) VALUES (?, ?, 'running', ?)`
+      `INSERT INTO runs (run_date, since_at, status, total_channels, scope_folder_ids, scope_label) VALUES (?, ?, 'running', ?, ?, ?)`
     )
-    .bind(runDate, sinceAt, channelIds.length)
+    .bind(
+      runDate,
+      sinceAt,
+      channelIds.length,
+      scope && scope.folderIds ? JSON.stringify(scope.folderIds) : null,
+      scope && scope.label ? scope.label : null
+    )
     .run()
   const runId = res.meta.last_row_id as number
 

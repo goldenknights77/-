@@ -10,6 +10,15 @@ import {
   insertChannel,
   deleteChannel,
   setChannelActive,
+  setChannelFolder,
+  setChannelsFolderBulk,
+  listFolders,
+  createFolder,
+  renameFolder,
+  moveFolder,
+  deleteFolder,
+  getFolderSubtreeIds,
+  listActiveChannelsInFolders,
   createRun,
   getRun,
   listRuns,
@@ -110,7 +119,79 @@ app.patch('/api/channels/:id', async (c) => {
   const id = Number(c.req.param('id'))
   if (!Number.isInteger(id)) return c.json({ error: '잘못된 채널 id 입니다.' }, 400)
   const body = await c.req.json().catch(() => ({}))
-  await setChannelActive(c.env.DB, id, !!body.active)
+  if (typeof body.active === 'boolean') {
+    await setChannelActive(c.env.DB, id, body.active)
+  }
+  if ('folderId' in body) {
+    const folderId = body.folderId === null ? null : Number(body.folderId)
+    if (folderId !== null && !Number.isInteger(folderId)) {
+      return c.json({ error: '잘못된 폴더 id 입니다.' }, 400)
+    }
+    await setChannelFolder(c.env.DB, id, folderId)
+  }
+  return c.json({ ok: true })
+})
+
+// 여러 채널을 한번에 다른 폴더로 이동 (드래그 앤 드롭/체크박스 이동용)
+app.post('/api/channels/move', async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const ids: number[] = Array.isArray(body?.ids) ? body.ids.map((x: any) => Number(x)).filter((n: number) => Number.isInteger(n)) : []
+  if (ids.length === 0) return c.json({ error: '이동할 채널을 선택해주세요.' }, 400)
+  const folderId = body.folderId === null || body.folderId === undefined ? null : Number(body.folderId)
+  if (folderId !== null && !Number.isInteger(folderId)) return c.json({ error: '잘못된 폴더 id 입니다.' }, 400)
+  await setChannelsFolderBulk(c.env.DB, ids, folderId)
+  return c.json({ ok: true })
+})
+
+// ---------------------------------------------------------------------------
+// Folders API (채널 카테고리 - 무제한 depth의 폴더 트리)
+// ---------------------------------------------------------------------------
+
+app.get('/api/folders', async (c) => {
+  const folders = await listFolders(c.env.DB)
+  return c.json({ folders })
+})
+
+app.post('/api/folders', async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const name = (body?.name || '').trim()
+  if (!name) return c.json({ error: '폴더 이름을 입력해주세요.' }, 400)
+  let parentId: number | null = null
+  if (body.parentId !== undefined && body.parentId !== null) {
+    parentId = Number(body.parentId)
+    if (!Number.isInteger(parentId)) return c.json({ error: '잘못된 상위 폴더 id 입니다.' }, 400)
+  }
+  const folder = await createFolder(c.env.DB, name, parentId)
+  return c.json({ folder })
+})
+
+app.patch('/api/folders/:id', async (c) => {
+  const id = Number(c.req.param('id'))
+  if (!Number.isInteger(id)) return c.json({ error: '잘못된 폴더 id 입니다.' }, 400)
+  const body = await c.req.json().catch(() => ({}))
+  if (typeof body.name === 'string' && body.name.trim()) {
+    await renameFolder(c.env.DB, id, body.name.trim())
+  }
+  if ('parentId' in body) {
+    let parentId: number | null = null
+    if (body.parentId !== null && body.parentId !== undefined) {
+      parentId = Number(body.parentId)
+      if (!Number.isInteger(parentId)) return c.json({ error: '잘못된 상위 폴더 id 입니다.' }, 400)
+      if (parentId === id) return c.json({ error: '폴더를 자기 자신의 하위로 이동할 수 없습니다.' }, 400)
+      const subtree = await getFolderSubtreeIds(c.env.DB, id)
+      if (subtree.includes(parentId)) {
+        return c.json({ error: '폴더를 자신의 하위 폴더로 이동할 수 없습니다.' }, 400)
+      }
+    }
+    await moveFolder(c.env.DB, id, parentId)
+  }
+  return c.json({ ok: true })
+})
+
+app.delete('/api/folders/:id', async (c) => {
+  const id = Number(c.req.param('id'))
+  if (!Number.isInteger(id)) return c.json({ error: '잘못된 폴더 id 입니다.' }, 400)
+  await deleteFolder(c.env.DB, id)
   return c.json({ ok: true })
 })
 
@@ -126,6 +207,12 @@ app.post('/api/channels/resolve-batch', async (c) => {
   const body = await c.req.json().catch(() => ({}))
   const lines: string[] = Array.isArray(body?.lines) ? body.lines : []
   if (lines.length === 0) return c.json({ results: [] })
+
+  let folderId: number | null = null
+  if (body.folderId !== undefined && body.folderId !== null && body.folderId !== '') {
+    folderId = Number(body.folderId)
+    if (!Number.isInteger(folderId)) return c.json({ error: '잘못된 폴더 id 입니다.' }, 400)
+  }
 
   const parsedList = lines.map((l) => ({ raw: l, parsed: parseChannelInput(l) })).filter((x) => x.parsed)
 
@@ -162,7 +249,8 @@ app.post('/api/channels/resolve-batch', async (c) => {
           handle: info.handle,
           thumbnail: info.thumbnail,
           uploads_playlist_id: info.uploadsPlaylistId,
-          input_url: item.raw
+          input_url: item.raw,
+          folder_id: folderId
         })
         results.push({ raw: item.raw, status: 'added', channelId: info.channelId, title: info.title })
       }
@@ -186,7 +274,8 @@ app.post('/api/channels/resolve-batch', async (c) => {
           handle: info.handle,
           thumbnail: info.thumbnail,
           uploads_playlist_id: info.uploadsPlaylistId,
-          input_url: item.raw
+          input_url: item.raw,
+          folder_id: folderId
         })
         results.push({ raw: item.raw, status: 'added', channelId: info.channelId, title: info.title })
       } catch (e: any) {
@@ -223,13 +312,36 @@ app.post('/api/runs', async (c) => {
     return c.json({ run: existing, resumed: true })
   }
 
-  const channels = await listActiveChannels(c.env.DB)
-  if (channels.length === 0) {
-    return c.json({ error: '등록된 활성 채널이 없습니다. 먼저 채널을 추가해주세요.' }, 400)
+  const body = await c.req.json().catch(() => ({}))
+  const rawFolderIds: number[] = Array.isArray(body?.folderIds)
+    ? body.folderIds.map((x: any) => Number(x)).filter((n: number) => Number.isInteger(n))
+    : []
+  const scopeLabel: string | null = typeof body?.scopeLabel === 'string' && body.scopeLabel.trim() ? body.scopeLabel.trim() : null
+
+  let channels
+  let scope: { folderIds: number[] | null; label: string | null } | undefined
+
+  if (rawFolderIds.length > 0) {
+    // 선택된 폴더(및 하위 폴더 전부)에 속한 활성 채널만 대상
+    const allFolderIds = new Set<number>()
+    for (const fid of rawFolderIds) {
+      const subtree = await getFolderSubtreeIds(c.env.DB, fid)
+      subtree.forEach((id) => allFolderIds.add(id))
+    }
+    channels = await listActiveChannelsInFolders(c.env.DB, Array.from(allFolderIds))
+    scope = { folderIds: rawFolderIds, label: scopeLabel }
+    if (channels.length === 0) {
+      return c.json({ error: '선택한 폴더에 활성 채널이 없습니다.' }, 400)
+    }
+  } else {
+    channels = await listActiveChannels(c.env.DB)
+    if (channels.length === 0) {
+      return c.json({ error: '등록된 활성 채널이 없습니다. 먼저 채널을 추가해주세요.' }, 400)
+    }
   }
 
   const since = isoMinusHours(24)
-  const run = await createRun(c.env.DB, seoulDateString(), since, channels.map((ch) => ch.channel_id))
+  const run = await createRun(c.env.DB, seoulDateString(), since, channels.map((ch) => ch.channel_id), scope)
   return c.json({ run })
 })
 

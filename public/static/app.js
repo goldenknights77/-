@@ -15,6 +15,7 @@
     booted: false,
     settings: { hasApiKey: false, apiKeyMasked: null },
     channels: [],
+    folders: [], // { id, parent_id, name, sort_order }
     runs: [],
     currentRunId: null,
     currentRun: null,
@@ -24,8 +25,74 @@
     runBusy: false,
     importBusy: false,
     importProgress: null, // { total, done, added, duplicated, failed, log: [] }
-    channelFilter: ''
+    channelFilter: '',
+    channelFolderFilter: 'all', // 'all' | 'unassigned' | <folderId>
+    expandedFolders: new Set(),
+    addingChildTo: null, // 인라인 하위폴더 추가 입력을 표시할 부모 폴더 id
+    selectedChannelIds: new Set(),
+    runFolderIds: [], // 오늘의 체크 범위로 선택된 폴더 id 목록 (비어있으면 전체)
+    importFolderId: null // 대량 등록 시 채널을 넣을 폴더 (드롭다운 선택값 유지용)
   };
+
+  // ---------------------------------------------------------------------
+  // Folder tree helpers (client-side)
+  // ---------------------------------------------------------------------
+
+  function folderById(id) {
+    return state.folders.find((f) => f.id === id) || null;
+  }
+
+  function folderChildren(parentId) {
+    return state.folders
+      .filter((f) => f.parent_id === parentId)
+      .sort((a, b) => (a.sort_order - b.sort_order) || (a.id - b.id));
+  }
+
+  // 해당 폴더 + 모든 하위 폴더 id (클라이언트 사이드, 필터링용)
+  function getSubtreeIdsClient(folderId) {
+    const result = [folderId];
+    const stack = [folderId];
+    while (stack.length) {
+      const cur = stack.pop();
+      for (const f of state.folders) {
+        if (f.parent_id === cur) { result.push(f.id); stack.push(f.id); }
+      }
+    }
+    return result;
+  }
+
+  function folderPath(folderId) {
+    const parts = [];
+    let cur = folderById(folderId);
+    while (cur) {
+      parts.unshift(cur.name);
+      cur = cur.parent_id ? folderById(cur.parent_id) : null;
+    }
+    return parts.join(' > ');
+  }
+
+  function channelCountInFolder(folderId) {
+    const ids = new Set(getSubtreeIdsClient(folderId));
+    return state.channels.filter((c) => c.folder_id != null && ids.has(c.folder_id)).length;
+  }
+
+  // 채널 관리 탭에서 폴더 선택 <select> 옵션 (들여쓰기로 depth 표현)
+  function buildFolderOptions(selectedId, opts) {
+    opts = opts || {};
+    const lines = [];
+    if (!opts.noUnassigned) {
+      lines.push(`<option value="" ${selectedId == null ? 'selected' : ''}>미분류</option>`);
+    }
+    function walk(parentId, depth) {
+      for (const f of folderChildren(parentId)) {
+        const prefix = '　'.repeat(depth) + (depth > 0 ? '└ ' : '');
+        lines.push(`<option value="${f.id}" ${selectedId === f.id ? 'selected' : ''}>${prefix}${esc(f.name)}</option>`);
+        walk(f.id, depth + 1);
+      }
+    }
+    walk(null, 0);
+    return lines.join('');
+  }
 
   // ---------------------------------------------------------------------
   // Utils
@@ -96,6 +163,11 @@
     state.channels = r.channels || [];
   }
 
+  async function loadFolders() {
+    const r = await api('/api/folders');
+    state.folders = r.folders || [];
+  }
+
   async function loadRuns() {
     const r = await api('/api/runs');
     state.runs = r.runs || [];
@@ -152,6 +224,10 @@
     if (lines.length === 0) { showToast('등록할 채널 URL/ID를 입력해주세요.', true); return; }
     if (!state.settings.hasApiKey) { showToast('먼저 설정 탭에서 YouTube API 키를 등록해주세요.', true); return; }
 
+    const folderSelect = document.getElementById('bulk-import-folder-select');
+    const folderId = folderSelect && folderSelect.value ? Number(folderSelect.value) : null;
+    state.importFolderId = folderId;
+
     const CHUNK = 15;
     state.importBusy = true;
     state.importProgress = { total: lines.length, done: 0, added: 0, duplicated: 0, failed: 0, log: [] };
@@ -160,7 +236,7 @@
     for (let i = 0; i < lines.length; i += CHUNK) {
       const chunk = lines.slice(i, i + CHUNK);
       try {
-        const r = await api('/api/channels/resolve-batch', { method: 'POST', body: JSON.stringify({ lines: chunk }) });
+        const r = await api('/api/channels/resolve-batch', { method: 'POST', body: JSON.stringify({ lines: chunk, folderId }) });
         for (const item of (r.results || [])) {
           state.importProgress.done++;
           if (item.status === 'added') state.importProgress.added++;
@@ -191,6 +267,7 @@
   async function deleteChannel(id) {
     if (!confirm('이 채널을 목록에서 삭제하시겠습니까?')) return;
     await api(`/api/channels/${id}`, { method: 'DELETE' });
+    state.selectedChannelIds.delete(id);
     await loadChannels();
     render();
   }
@@ -198,6 +275,113 @@
   async function toggleChannelActive(id, active) {
     await api(`/api/channels/${id}`, { method: 'PATCH', body: JSON.stringify({ active }) });
     await loadChannels();
+    render();
+  }
+
+  async function moveChannelToFolder(id, folderId) {
+    await api(`/api/channels/${id}`, { method: 'PATCH', body: JSON.stringify({ folderId }) });
+    await loadChannels();
+    render();
+  }
+
+  async function moveSelectedChannelsToFolder(folderId) {
+    const ids = Array.from(state.selectedChannelIds);
+    if (ids.length === 0) { showToast('이동할 채널을 먼저 선택해주세요.', true); return; }
+    await api('/api/channels/move', { method: 'POST', body: JSON.stringify({ ids, folderId }) });
+    state.selectedChannelIds = new Set();
+    await loadChannels();
+    showToast(`${ids.length}개 채널을 ${folderId ? folderPath(folderId) : '미분류'}(으)로 이동했습니다.`);
+    render();
+  }
+
+  function toggleChannelSelected(id) {
+    if (state.selectedChannelIds.has(id)) state.selectedChannelIds.delete(id);
+    else state.selectedChannelIds.add(id);
+    render();
+  }
+
+  // ---- 폴더(카테고리) 관리 ----
+
+  async function createRootFolder() {
+    const input = document.getElementById('new-folder-input');
+    const name = (input && input.value || '').trim();
+    if (!name) { showToast('폴더 이름을 입력해주세요.', true); return; }
+    await api('/api/folders', { method: 'POST', body: JSON.stringify({ name }) });
+    await loadFolders();
+    if (input) input.value = '';
+    render();
+  }
+
+  function showAddChildInput(parentId) {
+    state.addingChildTo = parentId;
+    state.expandedFolders.add(parentId);
+    render();
+    setTimeout(() => {
+      const el = document.getElementById('new-child-folder-input');
+      if (el) el.focus();
+    }, 0);
+  }
+
+  async function createChildFolder(parentId) {
+    const input = document.getElementById('new-child-folder-input');
+    const name = (input && input.value || '').trim();
+    if (!name) { showToast('폴더 이름을 입력해주세요.', true); return; }
+    await api('/api/folders', { method: 'POST', body: JSON.stringify({ name, parentId }) });
+    state.addingChildTo = null;
+    await loadFolders();
+    render();
+  }
+
+  async function renameFolderPrompt(id) {
+    const f = folderById(id);
+    const name = prompt('새 폴더 이름을 입력하세요.', f ? f.name : '');
+    if (name === null) return;
+    const trimmed = name.trim();
+    if (!trimmed) { showToast('폴더 이름을 입력해주세요.', true); return; }
+    await api(`/api/folders/${id}`, { method: 'PATCH', body: JSON.stringify({ name: trimmed }) });
+    await loadFolders();
+    render();
+  }
+
+  async function deleteFolderConfirm(id) {
+    const f = folderById(id);
+    const label = f ? folderPath(id) : '이 폴더';
+    if (!confirm(`'${label}' 폴더(하위 폴더 포함)를 삭제하시겠습니까?\n안에 있던 채널은 삭제되지 않고 '미분류'로 이동됩니다.`)) return;
+    await api(`/api/folders/${id}`, { method: 'DELETE' });
+    if (state.channelFolderFilter === id || (typeof state.channelFolderFilter === 'number' && getSubtreeIdsClient(id).includes(state.channelFolderFilter))) {
+      state.channelFolderFilter = 'all';
+    }
+    state.runFolderIds = state.runFolderIds.filter((fid) => fid !== id);
+    await Promise.all([loadFolders(), loadChannels()]);
+    render();
+  }
+
+  async function moveFolderToParent(id, newParentId) {
+    try {
+      await api(`/api/folders/${id}`, { method: 'PATCH', body: JSON.stringify({ parentId: newParentId }) });
+      await loadFolders();
+      render();
+    } catch (e) {
+      showToast(e.message, true);
+    }
+  }
+
+  function toggleFolderExpanded(id) {
+    if (state.expandedFolders.has(id)) state.expandedFolders.delete(id);
+    else state.expandedFolders.add(id);
+    render();
+  }
+
+  function selectChannelFolderFilter(key) {
+    state.channelFolderFilter = key;
+    state.selectedChannelIds = new Set();
+    render();
+  }
+
+  function toggleRunFolder(folderId) {
+    const idx = state.runFolderIds.indexOf(folderId);
+    if (idx >= 0) state.runFolderIds.splice(idx, 1);
+    else state.runFolderIds.push(folderId);
     render();
   }
 
@@ -215,11 +399,25 @@
 
   async function startRun() {
     if (!state.settings.hasApiKey) { showToast('먼저 설정 탭에서 YouTube API 키를 등록해주세요.', true); return; }
-    const activeCount = state.channels.filter((c) => c.active).length;
-    if (activeCount === 0) { showToast('활성화된 채널이 없습니다. 채널 관리 탭에서 채널을 등록해주세요.', true); return; }
+
+    const folderIds = state.runFolderIds.slice();
+    let activeCount;
+    let scopeLabel = null;
+    if (folderIds.length > 0) {
+      const subtreeIds = new Set();
+      folderIds.forEach((fid) => getSubtreeIdsClient(fid).forEach((id) => subtreeIds.add(id)));
+      activeCount = state.channels.filter((c) => c.active && c.folder_id != null && subtreeIds.has(c.folder_id)).length;
+      scopeLabel = folderIds.map((fid) => folderPath(fid)).join(', ');
+    } else {
+      activeCount = state.channels.filter((c) => c.active).length;
+    }
+    if (activeCount === 0) { showToast('선택한 범위에 활성화된 채널이 없습니다.', true); return; }
 
     try {
-      const r = await api('/api/runs', { method: 'POST' });
+      const r = await api('/api/runs', {
+        method: 'POST',
+        body: JSON.stringify({ folderIds, scopeLabel })
+      });
       state.currentRunId = r.run.id;
       state.currentRun = r.run;
       state.runBusy = true;
@@ -302,8 +500,39 @@
     `;
   }
 
+  // 대시보드에서 오늘 체크할 범위(폴더)를 고르는 버튼들
+  function renderRunFolderScopeBar() {
+    if (state.folders.length === 0) return '';
+    const allActive = state.runFolderIds.length === 0;
+    const chips = [`<button class="folder-chip all ${allActive ? 'active' : ''}" data-action="run-scope-all">전체</button>`];
+    // 폴더 전체를 경로 문자열과 함께 평탄화 (선택 시 하위 채널까지 포함됨을 명확히 하기 위해 경로 표시)
+    function walk(parentId) {
+      for (const f of folderChildren(parentId)) {
+        const active = state.runFolderIds.includes(f.id);
+        const count = channelCountInFolder(f.id);
+        chips.push(`<button class="folder-chip ${active ? 'active' : ''}" data-action="run-scope-toggle" data-id="${f.id}">${esc(folderPath(f.id))} <span class="muted" style="opacity:.8;">(${count})</span></button>`);
+        walk(f.id);
+      }
+    }
+    walk(null);
+    return `
+      <div class="row" style="margin:4px 0 4px; align-items:center;">
+        <span class="muted" style="font-size:12.5px;">체크 범위:</span>
+      </div>
+      <div class="folder-scope-bar">${chips.join('')}</div>
+    `;
+  }
+
   function renderRunPanel() {
-    const activeCount = state.channels.filter((c) => c.active).length;
+    const folderIds = state.runFolderIds;
+    let activeCount;
+    if (folderIds.length > 0) {
+      const subtreeIds = new Set();
+      folderIds.forEach((fid) => getSubtreeIdsClient(fid).forEach((id) => subtreeIds.add(id)));
+      activeCount = state.channels.filter((c) => c.active && c.folder_id != null && subtreeIds.has(c.folder_id)).length;
+    } else {
+      activeCount = state.channels.filter((c) => c.active).length;
+    }
     const run = state.currentRun;
     const isRunningState = run && run.status === 'running';
     const queue = state.currentQueue;
@@ -332,17 +561,19 @@
     }
 
     const disabled = state.runBusy || activeCount === 0 || !state.settings.hasApiKey;
+    const scopeText = folderIds.length > 0 ? folderIds.map((fid) => folderPath(fid)).join(', ') : '전체 채널';
 
     return `
       <div class="panel">
         <h2>오늘의 체크</h2>
-        <p class="muted">등록된 활성 채널 ${fmtNum(activeCount)}개를 기준으로, 최근 24시간 내 업로드된 영상을 확인합니다.</p>
-        <div class="row">
+        <p class="muted">선택 범위: <b>${esc(scopeText)}</b> · 활성 채널 ${fmtNum(activeCount)}개 기준으로 최근 24시간 내 업로드된 영상을 확인합니다.</p>
+        ${renderRunFolderScopeBar()}
+        <div class="row" style="margin-top:10px;">
           <button class="btn-primary" data-action="start-run" ${disabled ? 'disabled' : ''}>
             ${state.runBusy ? '체크 진행 중...' : '오늘 체크 시작'}
           </button>
           ${!state.settings.hasApiKey ? '<span class="muted">※ API 키를 먼저 등록해주세요.</span>' : ''}
-          ${state.settings.hasApiKey && activeCount === 0 ? '<span class="muted">※ 활성화된 채널이 없습니다.</span>' : ''}
+          ${state.settings.hasApiKey && activeCount === 0 ? '<span class="muted">※ 선택 범위에 활성화된 채널이 없습니다.</span>' : ''}
         </div>
         ${progressHtml}
       </div>
@@ -365,10 +596,11 @@
           ? '<span class="badge badge-red">중단됨</span>'
           : '<span class="badge badge-green">완료</span>';
       const selected = state.currentRunId === r.id ? 'style="border-color:var(--accent)"' : '';
+      const scopeBadge = r.scope_label ? `<span class="scope-badge">📁 ${esc(r.scope_label)}</span>` : '<span class="scope-badge" style="background:rgba(154,164,178,.15); color:var(--text-dim);">전체</span>';
       return `
         <div class="run-row" ${selected} data-action="select-run" data-id="${r.id}">
           <div class="date">${esc(r.run_date)} ${statusBadge}</div>
-          <div class="stats">채널 ${fmtNum(r.total_channels)} · 영상 ${fmtNum(r.videos_found)} · 실패 ${fmtNum(r.channels_failed)}</div>
+          <div class="stats">${scopeBadge} 채널 ${fmtNum(r.total_channels)} · 영상 ${fmtNum(r.videos_found)} · 실패 ${fmtNum(r.channels_failed)}</div>
           <button class="btn-danger" data-action="delete-run" data-id="${r.id}">삭제</button>
         </div>
       `;
@@ -427,9 +659,13 @@
       gridHtml = `<div class="video-grid">${cards}</div>`;
     }
 
+    const scopeBadge = state.currentRun && state.currentRun.scope_label
+      ? `<span class="scope-badge">📁 ${esc(state.currentRun.scope_label)}</span>`
+      : '';
+
     return `
       <div class="panel">
-        <h2>결과 <span class="muted" style="font-weight:400;">(${state.currentRun ? esc(state.currentRun.run_date) : ''})</span></h2>
+        <h2>결과 <span class="muted" style="font-weight:400;">(${state.currentRun ? esc(state.currentRun.run_date) : ''})</span> ${scopeBadge}</h2>
         <div class="filter-bar">${filterChips}</div>
         <div class="muted" style="margin-bottom:10px;">조건을 만족하는 영상: ${fmtNum(state.currentVideos.length)}개</div>
         ${gridHtml}
@@ -474,22 +710,130 @@
     `;
   }
 
-  function renderChannels() {
-    const filtered = state.channelFilter
-      ? state.channels.filter((c) => (c.title || '').toLowerCase().includes(state.channelFilter.toLowerCase()) || (c.handle || '').toLowerCase().includes(state.channelFilter.toLowerCase()))
-      : state.channels;
+  // 폴더 트리 재귀 렌더링 (좌측 사이드바)
+  function renderFolderTree() {
+    function renderNode(f, depth) {
+      const isActive = state.channelFolderFilter === f.id;
+      const count = channelCountInFolder(f.id);
+      const children = folderChildren(f.id);
+      const expanded = state.expandedFolders.has(f.id) || children.length === 0;
+      const caret = children.length > 0 ? (expanded ? '▾' : '▸') : '　';
+      let html = `
+        <div class="folder-node ${isActive ? 'active' : ''}" style="padding-left:${8 + depth * 14}px;" data-action="select-folder" data-id="${f.id}" data-drop-folder="${f.id}">
+          ${children.length > 0 ? `<span class="icon" data-action="toggle-folder-expand" data-id="${f.id}" style="cursor:pointer; width:14px; text-align:center;">${caret}</span>` : '<span class="icon" style="width:14px;"></span>'}
+          <span class="icon">📁</span>
+          <span class="fname">${esc(f.name)}</span>
+          <span class="count">${count}</span>
+          <button class="fbtn" data-action="add-child-folder" data-id="${f.id}" title="하위 폴더 추가">＋</button>
+          <button class="fbtn" data-action="rename-folder" data-id="${f.id}" title="이름 변경">✎</button>
+          <button class="fbtn" data-action="delete-folder" data-id="${f.id}" title="삭제">🗑</button>
+        </div>
+      `;
+      if (state.addingChildTo === f.id) {
+        html += `
+          <div class="folder-add-child-row" style="padding-left:${8 + (depth + 1) * 14}px;">
+            <input type="text" id="new-child-folder-input" placeholder="하위 폴더 이름 (예: 축구)" />
+            <button class="btn-secondary" data-action="confirm-add-child-folder" data-id="${f.id}">추가</button>
+            <button class="btn-ghost" data-action="cancel-add-child-folder">취소</button>
+          </div>
+        `;
+      }
+      if (expanded) {
+        for (const child of children) {
+          html += renderNode(child, depth + 1);
+        }
+      }
+      return html;
+    }
 
-    const channelRows = filtered.map((c) => `
-      <div class="channel-row">
+    const rootNodes = folderChildren(null).map((f) => renderNode(f, 0)).join('');
+    const unassignedCount = state.channels.filter((c) => c.folder_id == null).length;
+
+    return `
+      <div class="folder-panel">
+        <h2>📂 폴더</h2>
+        <div class="folder-new-row">
+          <input type="text" id="new-folder-input" placeholder="새 폴더 이름 (예: 스포츠)" />
+          <button class="btn-primary" data-action="create-root-folder">추가</button>
+        </div>
+        <div class="folder-tree">
+          <div class="folder-node ${state.channelFolderFilter === 'all' ? 'active' : ''}" data-action="select-folder" data-id="all">
+            <span class="icon" style="width:14px;"></span>
+            <span class="icon">📚</span>
+            <span class="fname">전체 채널</span>
+            <span class="count">${state.channels.length}</span>
+          </div>
+          <div class="folder-node ${state.channelFolderFilter === 'unassigned' ? 'active' : ''}" data-action="select-folder" data-id="unassigned" data-drop-folder="unassigned">
+            <span class="icon" style="width:14px;"></span>
+            <span class="icon">🗂️</span>
+            <span class="fname">미분류</span>
+            <span class="count">${unassignedCount}</span>
+          </div>
+          ${rootNodes}
+          ${state.addingChildTo === null ? '' : ''}
+        </div>
+        <p class="muted" style="margin-top:10px; line-height:1.5;">
+          폴더 안에 폴더를 만들어 축구/야구처럼 세부 카테고리로 나눌 수 있어요.<br/>
+          채널 목록에서 이동할 폴더를 선택하면 바로 옮길 수 있습니다.
+        </p>
+      </div>
+    `;
+  }
+
+  function channelRowHtml(c) {
+    const selected = state.selectedChannelIds.has(c.id);
+    return `
+      <div class="channel-row ${selected ? 'selected' : ''}" draggable="true" title="드래그하여 폴더로 이동할 수 있습니다">
+        <input type="checkbox" data-action="toggle-channel-select" data-id="${c.id}" ${selected ? 'checked' : ''} />
         <img src="${esc(c.thumbnail || '')}" alt="" />
         <div class="name">${esc(c.title || c.channel_id)} <span class="sub">${esc(c.handle || '')}</span></div>
+        <select class="move-select" data-action="move-channel-folder" data-id="${c.id}">
+          ${buildFolderOptions(c.folder_id)}
+        </select>
         <label class="muted" style="display:flex; align-items:center; gap:4px; font-size:12px;">
           <input type="checkbox" data-action="toggle-active" data-id="${c.id}" ${c.active ? 'checked' : ''} />
           활성
         </label>
         <button class="btn-danger" data-action="delete-channel" data-id="${c.id}">삭제</button>
       </div>
-    `).join('');
+    `;
+  }
+
+  function getFilteredChannels() {
+    let list = state.channels;
+    if (state.channelFolderFilter === 'unassigned') {
+      list = list.filter((c) => c.folder_id == null);
+    } else if (state.channelFolderFilter !== 'all') {
+      const ids = new Set(getSubtreeIdsClient(state.channelFolderFilter));
+      list = list.filter((c) => c.folder_id != null && ids.has(c.folder_id));
+    }
+    if (state.channelFilter) {
+      const q = state.channelFilter.toLowerCase();
+      list = list.filter((c) => (c.title || '').toLowerCase().includes(q) || (c.handle || '').toLowerCase().includes(q));
+    }
+    return list;
+  }
+
+  function renderChannels() {
+    const filtered = getFilteredChannels();
+    const channelRows = filtered.map(channelRowHtml).join('');
+
+    const currentFolderLabel = state.channelFolderFilter === 'all'
+      ? '전체 채널'
+      : state.channelFolderFilter === 'unassigned'
+        ? '미분류'
+        : folderPath(state.channelFolderFilter) || '전체 채널';
+
+    const bulkMoveBar = state.selectedChannelIds.size > 0 ? `
+      <div class="row" style="margin-bottom:10px; background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:8px 12px;">
+        <span class="muted">${state.selectedChannelIds.size}개 선택됨</span>
+        <select class="move-select" id="bulk-move-select" style="max-width:180px;">
+          ${buildFolderOptions(null)}
+        </select>
+        <button class="btn-secondary" data-action="bulk-move-channels">선택한 채널 이동</button>
+        <button class="btn-ghost" data-action="clear-channel-selection">선택 해제</button>
+      </div>
+    ` : '';
 
     return `
       ${renderApiKeyWarning()}
@@ -497,21 +841,29 @@
         <h2>채널 대량 등록</h2>
         <p class="muted">유튜브 채널 URL, @핸들, 채널ID를 한 줄에 하나씩 붙여넣으세요. (최대 약 200개 권장)</p>
         <textarea id="bulk-import-textarea" placeholder="https://www.youtube.com/@somechannel&#10;https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx&#10;@another_handle" ${state.importBusy ? 'disabled' : ''}></textarea>
-        <div class="row" style="margin-top:10px;">
+        <div class="row" style="margin-top:10px; align-items:center;">
           <button class="btn-primary" data-action="bulk-import" ${state.importBusy ? 'disabled' : ''}>
             ${state.importBusy ? '등록 중...' : '일괄 등록'}
           </button>
+          <span class="muted">등록 대상 폴더:</span>
+          <select class="move-select" id="bulk-import-folder-select" style="max-width:200px;" ${state.importBusy ? 'disabled' : ''}>
+            ${buildFolderOptions(state.importFolderId)}
+          </select>
         </div>
         ${renderImportProgress()}
       </div>
 
-      <div class="panel">
-        <div class="row" style="justify-content:space-between;">
-          <h2 style="margin:0;">등록된 채널 (${state.channels.length}개)</h2>
-          <input type="text" id="channel-filter-input" placeholder="채널명 검색..." value="${esc(state.channelFilter)}" style="min-width:200px;" />
-        </div>
-        <div class="channel-list">
-          ${channelRows || '<div class="empty-state"><div class="big">📭</div>등록된 채널이 없습니다.</div>'}
+      <div class="channels-layout">
+        ${renderFolderTree()}
+        <div class="panel" style="margin-bottom:0;">
+          <div class="row" style="justify-content:space-between;">
+            <h2 style="margin:0;">${esc(currentFolderLabel)} (${filtered.length}개)</h2>
+            <input type="text" id="channel-filter-input" placeholder="채널명 검색..." value="${esc(state.channelFilter)}" style="min-width:200px;" />
+          </div>
+          ${bulkMoveBar}
+          <div class="channel-list">
+            ${channelRows || '<div class="empty-state"><div class="big">📭</div>이 폴더에 채널이 없습니다.</div>'}
+          </div>
         </div>
       </div>
     `;
@@ -590,6 +942,80 @@
       deleteRun(Number(el.getAttribute('data-id')));
       return;
     }
+
+    // ---- 폴더(카테고리) ----
+    if (action === 'select-folder') {
+      const raw = el.getAttribute('data-id');
+      selectChannelFolderFilter(raw === 'all' || raw === 'unassigned' ? raw : Number(raw));
+      return;
+    }
+    if (action === 'toggle-folder-expand') {
+      e.stopPropagation();
+      toggleFolderExpanded(Number(el.getAttribute('data-id')));
+      return;
+    }
+    if (action === 'create-root-folder') { createRootFolder(); return; }
+    if (action === 'add-child-folder') {
+      e.stopPropagation();
+      showAddChildInput(Number(el.getAttribute('data-id')));
+      return;
+    }
+    if (action === 'confirm-add-child-folder') {
+      e.stopPropagation();
+      createChildFolder(Number(el.getAttribute('data-id')));
+      return;
+    }
+    if (action === 'cancel-add-child-folder') {
+      e.stopPropagation();
+      state.addingChildTo = null;
+      render();
+      return;
+    }
+    if (action === 'rename-folder') {
+      e.stopPropagation();
+      renameFolderPrompt(Number(el.getAttribute('data-id')));
+      return;
+    }
+    if (action === 'delete-folder') {
+      e.stopPropagation();
+      deleteFolderConfirm(Number(el.getAttribute('data-id')));
+      return;
+    }
+
+    // ---- 채널 선택/일괄 이동 ----
+    if (action === 'bulk-move-channels') {
+      const sel = document.getElementById('bulk-move-select');
+      const val = sel ? sel.value : '';
+      moveSelectedChannelsToFolder(val ? Number(val) : null);
+      return;
+    }
+    if (action === 'clear-channel-selection') {
+      state.selectedChannelIds = new Set();
+      render();
+      return;
+    }
+
+    // ---- 대시보드 체크 범위(폴더) 선택 ----
+    if (action === 'run-scope-all') {
+      state.runFolderIds = [];
+      render();
+      return;
+    }
+    if (action === 'run-scope-toggle') {
+      toggleRunFolder(Number(el.getAttribute('data-id')));
+      return;
+    }
+  });
+
+  $app.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    if (e.target && e.target.id === 'new-folder-input') {
+      e.preventDefault();
+      createRootFolder();
+    } else if (e.target && e.target.id === 'new-child-folder-input') {
+      e.preventDefault();
+      if (state.addingChildTo != null) createChildFolder(state.addingChildTo);
+    }
   });
 
   $app.addEventListener('change', (e) => {
@@ -598,6 +1024,17 @@
     const action = el.getAttribute('data-action');
     if (action === 'toggle-active') {
       toggleChannelActive(Number(el.getAttribute('data-id')), el.checked);
+      return;
+    }
+    if (action === 'toggle-channel-select') {
+      toggleChannelSelected(Number(el.getAttribute('data-id')));
+      return;
+    }
+    if (action === 'move-channel-folder') {
+      const id = Number(el.getAttribute('data-id'));
+      const folderId = el.value ? Number(el.value) : null;
+      moveChannelToFolder(id, folderId);
+      return;
     }
   });
 
@@ -607,22 +1044,52 @@
       // 채널 목록만 다시 그리되, 포커스 유지를 위해 목록 부분만 갱신
       const listEl = $app.querySelector('.channel-list');
       if (listEl) {
-        const filtered = state.channelFilter
-          ? state.channels.filter((c) => (c.title || '').toLowerCase().includes(state.channelFilter.toLowerCase()) || (c.handle || '').toLowerCase().includes(state.channelFilter.toLowerCase()))
-          : state.channels;
-        const channelRows = filtered.map((c) => `
-          <div class="channel-row">
-            <img src="${esc(c.thumbnail || '')}" alt="" />
-            <div class="name">${esc(c.title || c.channel_id)} <span class="sub">${esc(c.handle || '')}</span></div>
-            <label class="muted" style="display:flex; align-items:center; gap:4px; font-size:12px;">
-              <input type="checkbox" data-action="toggle-active" data-id="${c.id}" ${c.active ? 'checked' : ''} />
-              활성
-            </label>
-            <button class="btn-danger" data-action="delete-channel" data-id="${c.id}">삭제</button>
-          </div>
-        `).join('');
-        listEl.innerHTML = channelRows || '<div class="empty-state"><div class="big">📭</div>검색 결과가 없습니다.</div>';
+        const filtered = getFilteredChannels();
+        listEl.innerHTML = filtered.map(channelRowHtml).join('') || '<div class="empty-state"><div class="big">📭</div>검색 결과가 없습니다.</div>';
       }
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  // 드래그 앤 드롭: 채널 카드를 폴더 노드 위로 끌어다 놓으면 그 폴더로 이동
+  // ---------------------------------------------------------------------
+
+  $app.addEventListener('dragstart', (e) => {
+    const row = e.target.closest('.channel-row');
+    if (!row) return;
+    const checkbox = row.querySelector('[data-action="toggle-channel-select"]');
+    const id = checkbox ? Number(checkbox.getAttribute('data-id')) : null;
+    if (id == null) return;
+    e.dataTransfer.setData('text/plain', String(id));
+    e.dataTransfer.effectAllowed = 'move';
+  });
+
+  $app.addEventListener('dragover', (e) => {
+    const node = e.target.closest('[data-drop-folder]');
+    if (!node) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    node.classList.add('drop-target');
+  });
+
+  $app.addEventListener('dragleave', (e) => {
+    const node = e.target.closest('[data-drop-folder]');
+    if (node) node.classList.remove('drop-target');
+  });
+
+  $app.addEventListener('drop', (e) => {
+    const node = e.target.closest('[data-drop-folder]');
+    if (!node) return;
+    e.preventDefault();
+    node.classList.remove('drop-target');
+    const raw = node.getAttribute('data-drop-folder');
+    const folderId = raw === 'unassigned' ? null : Number(raw);
+    const channelId = Number(e.dataTransfer.getData('text/plain'));
+    if (!Number.isInteger(channelId)) return;
+    if (state.selectedChannelIds.has(channelId) && state.selectedChannelIds.size > 1) {
+      moveSelectedChannelsToFolder(folderId);
+    } else {
+      moveChannelToFolder(channelId, folderId);
     }
   });
 
@@ -632,7 +1099,7 @@
 
   async function boot() {
     try {
-      await Promise.all([loadSettings(), loadChannels(), loadRuns()]);
+      await Promise.all([loadSettings(), loadChannels(), loadRuns(), loadFolders()]);
       if (!state.settings.hasApiKey) state.tab = 'settings';
       if (state.runs.length > 0) {
         const latest = state.runs[0];
