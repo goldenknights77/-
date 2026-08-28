@@ -101,12 +101,14 @@ app.get('/api/channels', async (c) => {
 
 app.delete('/api/channels/:id', async (c) => {
   const id = Number(c.req.param('id'))
+  if (!Number.isInteger(id)) return c.json({ error: '잘못된 채널 id 입니다.' }, 400)
   await deleteChannel(c.env.DB, id)
   return c.json({ ok: true })
 })
 
 app.patch('/api/channels/:id', async (c) => {
   const id = Number(c.req.param('id'))
+  if (!Number.isInteger(id)) return c.json({ error: '잘못된 채널 id 입니다.' }, 400)
   const body = await c.req.json().catch(() => ({}))
   await setChannelActive(c.env.DB, id, !!body.active)
   return c.json({ ok: true })
@@ -246,12 +248,14 @@ app.get('/api/runs/:id', async (c) => {
 
 app.delete('/api/runs/:id', async (c) => {
   const id = Number(c.req.param('id'))
+  if (!Number.isInteger(id)) return c.json({ error: '잘못된 실행 id 입니다.' }, 400)
   await deleteRun(c.env.DB, id)
   return c.json({ ok: true })
 })
 
 app.get('/api/runs/:id/videos', async (c) => {
   const id = Number(c.req.param('id'))
+  if (!Number.isInteger(id)) return c.json({ error: '잘못된 실행 id 입니다.' }, 400)
   const minViews = Number(c.req.query('minViews') || '0')
   const videos = await getRunVideos(c.env.DB, id, minViews)
   return c.json({ videos })
@@ -259,6 +263,7 @@ app.get('/api/runs/:id/videos', async (c) => {
 
 app.get('/api/runs/:id/errors', async (c) => {
   const id = Number(c.req.param('id'))
+  if (!Number.isInteger(id)) return c.json({ error: '잘못된 실행 id 입니다.' }, 400)
   const errors = await getRunErrors(c.env.DB, id)
   return c.json({ errors })
 })
