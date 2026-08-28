@@ -294,9 +294,34 @@
     render();
   }
 
+  async function bulkDeleteSelectedChannels() {
+    const ids = Array.from(state.selectedChannelIds);
+    if (ids.length === 0) { showToast('삭제할 채널을 먼저 선택해주세요.', true); return; }
+    if (!confirm(`선택한 ${ids.length}개 채널을 삭제하시겠습니까?`)) return;
+    for (const id of ids) {
+      await api(`/api/channels/${id}`, { method: 'DELETE' });
+    }
+    state.selectedChannelIds = new Set();
+    await loadChannels();
+    showToast(`${ids.length}개 채널을 삭제했습니다.`);
+    render();
+  }
+
   function toggleChannelSelected(id) {
     if (state.selectedChannelIds.has(id)) state.selectedChannelIds.delete(id);
     else state.selectedChannelIds.add(id);
+    render();
+  }
+
+  // 현재 폴더/검색 필터에 걸린 채널 전체를 선택/해제 (전체선택 체크박스)
+  function toggleSelectAllFiltered() {
+    const filtered = getFilteredChannels();
+    const allSelected = filtered.length > 0 && filtered.every((c) => state.selectedChannelIds.has(c.id));
+    if (allSelected) {
+      filtered.forEach((c) => state.selectedChannelIds.delete(c.id));
+    } else {
+      filtered.forEach((c) => state.selectedChannelIds.add(c.id));
+    }
     render();
   }
 
@@ -824,6 +849,14 @@
         ? '미분류'
         : folderPath(state.channelFolderFilter) || '전체 채널';
 
+    const allFilteredSelected = filtered.length > 0 && filtered.every((c) => state.selectedChannelIds.has(c.id));
+    const selectAllBar = filtered.length > 0 ? `
+      <label class="muted" style="display:flex; align-items:center; gap:6px; font-size:12.5px; margin-bottom:8px;">
+        <input type="checkbox" id="select-all-checkbox" data-action="select-all-channels" ${allFilteredSelected ? 'checked' : ''} />
+        전체선택 (${filtered.length}개)
+      </label>
+    ` : '';
+
     const bulkMoveBar = state.selectedChannelIds.size > 0 ? `
       <div class="row" style="margin-bottom:10px; background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:8px 12px;">
         <span class="muted">${state.selectedChannelIds.size}개 선택됨</span>
@@ -831,6 +864,7 @@
           ${buildFolderOptions(null)}
         </select>
         <button class="btn-secondary" data-action="bulk-move-channels">선택한 채널 이동</button>
+        <button class="btn-danger" data-action="bulk-delete-channels">선택한 채널 삭제</button>
         <button class="btn-ghost" data-action="clear-channel-selection">선택 해제</button>
       </div>
     ` : '';
@@ -860,6 +894,7 @@
             <h2 style="margin:0;">${esc(currentFolderLabel)} (${filtered.length}개)</h2>
             <input type="text" id="channel-filter-input" placeholder="채널명 검색..." value="${esc(state.channelFilter)}" style="min-width:200px;" />
           </div>
+          ${selectAllBar}
           ${bulkMoveBar}
           <div class="channel-list">
             ${channelRows || '<div class="empty-state"><div class="big">📭</div>이 폴더에 채널이 없습니다.</div>'}
@@ -989,6 +1024,10 @@
       moveSelectedChannelsToFolder(val ? Number(val) : null);
       return;
     }
+    if (action === 'bulk-delete-channels') {
+      bulkDeleteSelectedChannels();
+      return;
+    }
     if (action === 'clear-channel-selection') {
       state.selectedChannelIds = new Set();
       render();
@@ -1036,6 +1075,10 @@
       moveChannelToFolder(id, folderId);
       return;
     }
+    if (action === 'select-all-channels') {
+      toggleSelectAllFiltered();
+      return;
+    }
   });
 
   $app.addEventListener('input', (e) => {
@@ -1046,6 +1089,11 @@
       if (listEl) {
         const filtered = getFilteredChannels();
         listEl.innerHTML = filtered.map(channelRowHtml).join('') || '<div class="empty-state"><div class="big">📭</div>검색 결과가 없습니다.</div>';
+        const selectAllCheckbox = $app.querySelector('#select-all-checkbox');
+        if (selectAllCheckbox) {
+          const allSelected = filtered.length > 0 && filtered.every((c) => state.selectedChannelIds.has(c.id));
+          selectAllCheckbox.checked = allSelected;
+        }
       }
     }
   });
